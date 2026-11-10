@@ -1,0 +1,486 @@
+//@version=6
+// Multi-Setup Master v3 - ASCII ONLY, no line continuation
+// Setups: ORB, Liquidity Sweep, VWAP Fade, FVG Fill, EMA Pullback, Inside Bar
+// Patterns: OB, CHOCH, FVG, Demand/Supply, Liquidation, Hammer, Shooting Star
+// EMAs: 9, 15, 21, 41, 50, 100, 200
+
+strategy("Multi-Setup Master v3", overlay=true, initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.02, slippage=2, calc_on_every_tick=false, process_orders_on_close=false, pyramiding=0)
+
+setup = input.string("ORB", "Setup", options=["ORB", "Liquidity Sweep", "VWAP Fade", "FVG Fill", "EMA Pullback", "Inside Bar"], group="1. Setup")
+
+riskPct = input.float(1.5, "Risk % per trade", group="2. Risk", step=0.1)
+maxLev = input.float(10.0, "Max leverage (0=none)", group="2. Risk", step=0.5)
+partialPct = input.int(50, "Partial % at T1", group="2. Risk", minval=10, maxval=90)
+maxTrades = input.int(3, "Max trades per day", group="2. Risk", minval=1)
+maxDailyLoss = input.float(5.0, "Daily kill switch %", group="2. Risk", step=0.5)
+minScore = input.int(5, "Min confluence score", group="2. Risk", minval=1, maxval=12)
+
+atrLen = input.int(14, "ATR length", group="3. Common")
+blockNews = input.bool(false, "MANUAL news block", group="3. Common")
+
+orbSess = input.session("1330-1400", "ORB build session", group="4. ORB")
+orbMaxATR = input.float(1.5, "Max ORB range x ATR", group="4. ORB", step=0.1)
+orbMinATR = input.float(0.3, "Min ORB range x ATR", group="4. ORB", step=0.1)
+
+sweepBufATR = input.float(0.3, "Sweep depth x ATR", group="5. Liquidity Sweep", step=0.1)
+sweepStopATR = input.float(1.2, "Stop beyond wick x ATR", group="5. Liquidity Sweep", step=0.1)
+
+vwapDevATR = input.float(2.0, "Deviation from VWAP x ATR", group="6. VWAP Fade", step=0.1)
+vwapAdxMax = input.float(35.0, "ADX max for fade", group="6. VWAP Fade", step=1)
+
+fvgMinATR = input.float(0.5, "Min impulse x ATR", group="7. FVG Fill", step=0.1)
+emaPullbackATR = input.float(0.5, "Stop buffer x ATR", group="8. EMA Pullback", step=0.1)
+
+ibMomMinATR = input.float(0.8, "Min mother bar x ATR", group="9. Inside Bar", step=0.1)
+ibMomMaxATR = input.float(1.5, "Max mother bar x ATR", group="9. Inside Bar", step=0.1)
+
+obImpulseATR = input.float(1.0, "OB impulse x ATR", group="10. Patterns", step=0.1)
+obFreshBars = input.int(50, "OB freshness (bars)", group="10. Patterns")
+chochFresh = input.int(30, "CHOCH freshness (bars)", group="10. Patterns")
+fvgFresh = input.int(30, "FVG freshness (bars)", group="10. Patterns")
+zoneFresh = input.int(50, "DS zone freshness", group="10. Patterns")
+
+showLevels = input.bool(true, "Show session levels", group="11. Visuals")
+showSignals = input.bool(true, "Show entry signals", group="11. Visuals")
+showOB = input.bool(true, "Show Order Blocks", group="11. Visuals")
+showCHOCHvis = input.bool(true, "Show CHOCH markers", group="11. Visuals")
+showFVGvis = input.bool(true, "Show FVG zones", group="11. Visuals")
+showDemSup = input.bool(true, "Show Demand Supply", group="11. Visuals")
+showLiquidation = input.bool(false, "Show Liquidation magnets", group="11. Visuals")
+showCandles = input.bool(true, "Show Hammer Shooter", group="11. Visuals")
+showTable = input.bool(true, "Show status table", group="11. Visuals")
+showEMAs = input.bool(true, "Show EMA ribbon", group="11. Visuals")
+
+atr = ta.atr(atrLen)
+vwapD = ta.vwap(hlc3)
+volAvg = ta.sma(volume, 20)
+
+ema9 = ta.ema(close, 9)
+ema15 = ta.ema(close, 15)
+ema21 = ta.ema(close, 21)
+ema41 = ta.ema(close, 41)
+ema50 = ta.ema(close, 50)
+ema100 = ta.ema(close, 100)
+ema200 = ta.ema(close, 200)
+
+[dmiPlus, dmiMinus, adx] = ta.dmi(14, 14)
+
+newDay = ta.change(time("D")) != 0
+var int dayTrades = 0
+var float dayStartEq = na
+
+if newDay
+    dayTrades := 0
+    dayStartEq := strategy.equity
+
+dayPnL = strategy.equity - nz(dayStartEq, strategy.equity)
+lossCap = strategy.equity * maxDailyLoss / 100
+riskOK = dayPnL > -lossCap
+countOK = dayTrades < maxTrades
+
+bodySize = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+candleRange = high - low
+safeRange = math.max(candleRange, 0.00000001)
+
+hammerPart1 = lowerWick >= 2.0 * bodySize
+hammerPart2 = upperWick <= 0.3 * candleRange
+hammerPart3 = bodySize <= 0.4 * candleRange
+bullHammer = candleRange > 0 and hammerPart1 and hammerPart2 and hammerPart3
+
+starPart1 = upperWick >= 2.0 * bodySize
+starPart2 = lowerWick <= 0.3 * candleRange
+starPart3 = bodySize <= 0.4 * candleRange
+bearShooter = candleRange > 0 and starPart1 and starPart2 and starPart3
+
+bullImpulse = close > open and (close - open) >= obImpulseATR * atr
+bearImpulse = close < open and (open - close) >= obImpulseATR * atr
+rawBullOB = bullImpulse and close[1] < open[1]
+rawBearOB = bearImpulse and close[1] > open[1]
+
+var float lastBullOBTop = na
+var float lastBullOBBot = na
+var int lastBullOBBar = na
+var float lastBearOBTop = na
+var float lastBearOBBot = na
+var int lastBearOBBar = na
+
+if rawBullOB
+    lastBullOBTop := high[1]
+    lastBullOBBot := low[1]
+    lastBullOBBar := bar_index
+
+if rawBearOB
+    lastBearOBTop := high[1]
+    lastBearOBBot := low[1]
+    lastBearOBBar := bar_index
+
+bullOBFresh = not na(lastBullOBBar) and (bar_index - lastBullOBBar) <= obFreshBars
+bearOBFresh = not na(lastBearOBBar) and (bar_index - lastBearOBBar) <= obFreshBars
+
+priceInBullOB = bullOBFresh and low <= lastBullOBTop and close >= lastBullOBBot
+priceInBearOB = bearOBFresh and high >= lastBearOBBot and close <= lastBearOBTop
+
+ph = ta.pivothigh(5, 5)
+pl = ta.pivotlow(5, 5)
+
+var float lastPH = na
+var float lastPL = na
+
+if not na(ph)
+    lastPH := ph
+
+if not na(pl)
+    lastPL := pl
+
+bullChochRaw = not na(lastPH) and close > lastPH and close[1] <= lastPH
+bearChochRaw = not na(lastPL) and close < lastPL and close[1] >= lastPL
+
+var int lastBullChochBar = na
+var int lastBearChochBar = na
+
+if bullChochRaw
+    lastBullChochBar := bar_index
+
+if bearChochRaw
+    lastBearChochBar := bar_index
+
+bullChochFresh = not na(lastBullChochBar) and (bar_index - lastBullChochBar) <= chochFresh
+bearChochFresh = not na(lastBearChochBar) and (bar_index - lastBearChochBar) <= chochFresh
+
+rawBullFVG = low > high[2] and (high[2] - low[2]) >= fvgMinATR * atr
+rawBearFVG = high < low[2] and (high[2] - low[2]) >= fvgMinATR * atr
+
+var float fvgBullTop = na
+var float fvgBullBot = na
+var int fvgBullBar = na
+var float fvgBearTop = na
+var float fvgBearBot = na
+var int fvgBearBar = na
+
+if rawBullFVG
+    fvgBullTop := low
+    fvgBullBot := high[2]
+    fvgBullBar := bar_index
+
+if rawBearFVG
+    fvgBearTop := high
+    fvgBearBot := low[2]
+    fvgBearBar := bar_index
+
+fvgBullFresh = not na(fvgBullBar) and (bar_index - fvgBullBar) <= fvgFresh
+fvgBearFresh = not na(fvgBearBar) and (bar_index - fvgBearBar) <= fvgFresh
+
+priceInBullFVG = fvgBullFresh and low <= fvgBullTop and close >= fvgBullBot
+priceInBearFVG = fvgBearFresh and high >= fvgBearBot and close <= fvgBearTop
+
+var float demandTop = na
+var float demandBot = na
+var int demandBar = na
+var float supplyTop = na
+var float supplyBot = na
+var int supplyBar = na
+
+if bullImpulse
+    demandTop := high[1]
+    demandBot := low[1]
+    demandBar := bar_index
+
+if bearImpulse
+    supplyTop := high[1]
+    supplyBot := low[1]
+    supplyBar := bar_index
+
+demandFresh = not na(demandBar) and (bar_index - demandBar) <= zoneFresh
+supplyFresh = not na(supplyBar) and (bar_index - supplyBar) <= zoneFresh
+
+priceInDemand = demandFresh and low <= demandTop and close >= demandBot
+priceInSupply = supplyFresh and high >= supplyBot and close <= supplyTop
+
+swingHigh20 = ta.highest(high, 20)[1]
+swingLow20 = ta.lowest(low, 20)[1]
+nearSwingHigh = high >= swingHigh20 * 0.998 and high <= swingHigh20 * 1.002
+nearSwingLow = low <= swingLow20 * 1.002 and low >= swingLow20 * 0.998
+
+inORB = not na(time(timeframe.period, orbSess))
+var float orbHigh = na
+var float orbLow = na
+var int orbEndBar = na
+var bool orbReady = false
+
+if not inORB[1] and inORB
+    orbHigh := high
+    orbLow := low
+else if inORB
+    orbHigh := math.max(orbHigh, high)
+    orbLow := math.min(orbLow, low)
+
+if inORB[1] and not inORB
+    orbReady := true
+    orbEndBar := bar_index
+
+orbRng = not na(orbHigh) and not na(orbLow) ? orbHigh - orbLow : na
+orbSizeOK = not na(orbRng) and orbRng >= orbMinATR * atr and orbRng <= orbMaxATR * atr
+orbMode = setup == "ORB"
+orbBase = orbMode and orbReady and orbSizeOK and riskOK and countOK and not blockNews
+orbBarsSince = not na(orbEndBar) ? bar_index - orbEndBar : 999
+orbTimeOK = orbBarsSince <= 20
+orbBrkL = close > orbHigh and close[1] <= orbHigh
+orbBrkS = close < orbLow and close[1] >= orbLow
+orbLong = orbBase and orbTimeOK and orbBrkL
+orbShort = orbBase and orbTimeOK and orbBrkS
+
+inAsian = not na(time(timeframe.period, "0000-0700", "UTC"))
+var float aHigh = na
+var float aLow = na
+
+if not inAsian[1] and inAsian
+    aHigh := high
+    aLow := low
+else if inAsian
+    aHigh := math.max(aHigh, high)
+    aLow := math.min(aLow, low)
+
+asianLocked = not inAsian and inAsian[1]
+
+sweepMode = setup == "Liquidity Sweep"
+sweepBase = sweepMode and asianLocked and riskOK and countOK and not blockNews
+sweepDeepL = aLow - sweepBufATR * atr
+sweepDeepS = aHigh + sweepBufATR * atr
+sweepTrigL = low < sweepDeepL and close > aLow and close > open
+sweepTrigS = high > sweepDeepS and close < aHigh and close < open
+sweepL = sweepBase and sweepTrigL
+sweepS = sweepBase and sweepTrigS
+
+vwapDev = (close - vwapD) / atr
+vwapMode = setup == "VWAP Fade"
+vwapTrendOK = adx < vwapAdxMax
+vwapBase = vwapMode and vwapTrendOK and riskOK and countOK and not blockNews
+vwapLowDev = vwapDev <= -vwapDevATR
+vwapHighDev = vwapDev >= vwapDevATR
+vwapBullRej = close > open and (close - low) / safeRange >= 0.5
+vwapBearRej = close < open and (high - close) / safeRange >= 0.5
+fadeL = vwapBase and vwapLowDev and vwapBullRej
+fadeS = vwapBase and vwapHighDev and vwapBearRej
+
+fvgMode = setup == "FVG Fill"
+fvgBase = fvgMode and riskOK and countOK and not blockNews
+fvgFillL = fvgBase and priceInBullFVG and close > open
+fvgFillS = fvgBase and priceInBearFVG and close < open
+
+emaStackUp = ema9 > ema21 and ema21 > ema50 and ema50 > ema200
+emaStackDown = ema9 < ema21 and ema21 < ema50 and ema50 < ema200
+emaMode = setup == "EMA Pullback"
+emaTrendOK = adx > 20
+emaBase = emaMode and emaTrendOK and riskOK and countOK and not blockNews
+pullbackLow = math.min(ema21, ema41)
+pullbackHigh = math.max(ema21, ema41)
+emaPullLow = low <= pullbackLow and close >= pullbackLow and close > open and close > ema200
+emaPullHigh = high >= pullbackHigh and close <= pullbackHigh and close < open and close < ema200
+emaL = emaBase and emaStackUp and emaPullLow
+emaS = emaBase and emaStackDown and emaPullHigh
+
+ibBar = high < high[1] and low > low[1]
+momRng = high[1] - low[1]
+ibRangeOK = momRng >= ibMomMinATR * atr and momRng <= ibMomMaxATR * atr
+
+var bool ibActive = false
+var float momHigh = na
+var float momLow = na
+var int ibBarIdx = na
+
+if setup == "Inside Bar" and ibBar and ibRangeOK and not ibActive
+    ibActive := true
+    momHigh := high[1]
+    momLow := low[1]
+    ibBarIdx := bar_index
+
+if ibActive and not na(ibBarIdx) and (bar_index - ibBarIdx) > 3
+    ibActive := false
+
+ibMode = setup == "Inside Bar"
+ibBase = ibMode and ibActive and riskOK and countOK and not blockNews
+ibLong = ibBase and close > momHigh
+ibShort = ibBase and close < momLow
+
+scoreLong = 0
+scoreShort = 0
+
+if close > ema200
+    scoreLong += 2
+if close < ema200
+    scoreShort += 2
+if adx >= 20 and adx <= 35
+    scoreLong += 1
+    scoreShort += 1
+if volume >= 1.3 * volAvg
+    scoreLong += 1
+    scoreShort += 1
+if (close - low) / safeRange >= 0.6
+    scoreLong += 1
+if (high - close) / safeRange >= 0.6
+    scoreShort += 1
+if priceInBullOB
+    scoreLong += 1
+if priceInBearOB
+    scoreShort += 1
+if priceInBullFVG
+    scoreLong += 1
+if priceInBearFVG
+    scoreShort += 1
+if priceInDemand
+    scoreLong += 1
+if priceInSupply
+    scoreShort += 1
+if bullChochFresh
+    scoreLong += 1
+if bearChochFresh
+    scoreShort += 1
+if bullHammer
+    scoreLong += 1
+if bearShooter
+    scoreShort += 1
+if nearSwingLow
+    scoreLong += 1
+if nearSwingHigh
+    scoreShort += 1
+
+confluenceL = scoreLong >= minScore
+confluenceS = scoreShort >= minScore
+
+riskAmt = strategy.equity * riskPct / 100
+rawLong = orbLong or sweepL or fadeL or fvgFillL or emaL or ibLong
+rawShort = orbShort or sweepS or fadeS or fvgFillS or emaS or ibShort
+noPos = strategy.position_size == 0
+longFinal = rawLong and confluenceL and noPos
+shortFinal = rawShort and confluenceS and noPos
+
+var float stopLong = na
+var float stopShort = na
+
+if orbLong
+    stopLong := math.min(orbLow, close - 0.5 * atr)
+if orbShort
+    stopShort := math.max(orbHigh, close + 0.5 * atr)
+if sweepL
+    stopLong := low - sweepStopATR * atr
+if sweepS
+    stopShort := high + sweepStopATR * atr
+if fadeL
+    stopLong := close - 1.0 * atr
+if fadeS
+    stopShort := close + 1.0 * atr
+if fvgFillL and not na(fvgBullBot)
+    stopLong := fvgBullBot - 0.2 * atr
+if fvgFillS and not na(fvgBearTop)
+    stopShort := fvgBearTop + 0.2 * atr
+if emaL
+    stopLong := low - emaPullbackATR * atr
+if emaS
+    stopShort := high + emaPullbackATR * atr
+if ibLong
+    stopLong := momLow
+if ibShort
+    stopShort := momHigh
+
+if longFinal and not na(stopLong)
+    distL = close - stopLong
+    if distL > 0
+        t1L = close + distL
+        t2L = close + 2.0 * distL
+        qtyL = riskAmt / distL
+        if maxLev > 0
+            qtyL := math.min(qtyL, strategy.equity * maxLev / close)
+        if qtyL > 0
+            strategy.entry("L", strategy.long, qty=qtyL)
+            strategy.exit("L-T1", "L", qty_percent=partialPct, limit=t1L, stop=stopLong)
+            strategy.exit("L-T2", "L", limit=t2L, stop=stopLong)
+            dayTrades += 1
+
+if shortFinal and not na(stopShort)
+    distS = stopShort - close
+    if distS > 0
+        t1S = close - distS
+        t2S = close - 2.0 * distS
+        qtyS = riskAmt / distS
+        if maxLev > 0
+            qtyS := math.min(qtyS, strategy.equity * maxLev / close)
+        if qtyS > 0
+            strategy.entry("S", strategy.short, qty=qtyS)
+            strategy.exit("S-T1", "S", qty_percent=partialPct, limit=t1S, stop=stopShort)
+            strategy.exit("S-T2", "S", limit=t2S, stop=stopShort)
+            dayTrades += 1
+
+if ibLong or ibShort
+    ibActive := false
+
+plot(showLevels and setup == "ORB" and orbReady ? orbHigh : na, "ORB High", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showLevels and setup == "ORB" and orbReady ? orbLow : na, "ORB Low", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(showLevels and setup == "Liquidity Sweep" ? aHigh : na, "Asian High", color=color.new(color.red, 40), style=plot.style_linebr, linewidth=1)
+plot(showLevels and setup == "Liquidity Sweep" ? aLow : na, "Asian Low", color=color.new(color.green, 40), style=plot.style_linebr, linewidth=1)
+
+plot(setup == "VWAP Fade" ? vwapD : na, "VWAP", color=color.blue, style=plot.style_line, linewidth=2)
+
+plot(showEMAs ? ema9 : na, "EMA9", color=color.new(color.red, 50), linewidth=1)
+plot(showEMAs ? ema15 : na, "EMA15", color=color.new(color.orange, 50), linewidth=1)
+plot(showEMAs ? ema21 : na, "EMA21", color=color.new(color.yellow, 50), linewidth=1)
+plot(showEMAs ? ema41 : na, "EMA41", color=color.new(color.lime, 50), linewidth=1)
+plot(showEMAs ? ema50 : na, "EMA50", color=color.new(color.aqua, 40), linewidth=2)
+plot(showEMAs ? ema100 : na, "EMA100", color=color.new(color.purple, 50), linewidth=1)
+plot(showEMAs ? ema200 : na, "EMA200", color=color.new(color.white, 30), linewidth=2)
+
+plot(showSignals and longFinal ? low - atr * 0.5 : na, "Long signal", color=color.green, style=plot.style_circles, linewidth=3)
+plot(showSignals and shortFinal ? high + atr * 0.5 : na, "Short signal", color=color.red, style=plot.style_circles, linewidth=3)
+
+plot(showCandles and bullHammer ? low - atr * 0.3 : na, "Hammer", color=color.lime, style=plot.style_circles, linewidth=2)
+plot(showCandles and bearShooter ? high + atr * 0.3 : na, "Shooting Star", color=color.red, style=plot.style_circles, linewidth=2)
+
+plot(showCHOCHvis and bullChochRaw ? low - atr * 0.8 : na, "Bull CHOCH", color=color.aqua, style=plot.style_circles, linewidth=2)
+plot(showCHOCHvis and bearChochRaw ? high + atr * 0.8 : na, "Bear CHOCH", color=color.fuchsia, style=plot.style_circles, linewidth=2)
+
+plot(showOB and bullOBFresh ? lastBullOBTop : na, "Bull OB Top", color=color.new(color.green, 60), style=plot.style_linebr, linewidth=1)
+plot(showOB and bullOBFresh ? lastBullOBBot : na, "Bull OB Bot", color=color.new(color.green, 60), style=plot.style_linebr, linewidth=1)
+plot(showOB and bearOBFresh ? lastBearOBTop : na, "Bear OB Top", color=color.new(color.red, 60), style=plot.style_linebr, linewidth=1)
+plot(showOB and bearOBFresh ? lastBearOBBot : na, "Bear OB Bot", color=color.new(color.red, 60), style=plot.style_linebr, linewidth=1)
+
+plot(showFVGvis and fvgBullFresh ? fvgBullTop : na, "Bull FVG Top", color=color.new(color.teal, 60), style=plot.style_linebr, linewidth=1)
+plot(showFVGvis and fvgBullFresh ? fvgBullBot : na, "Bull FVG Bot", color=color.new(color.teal, 60), style=plot.style_linebr, linewidth=1)
+plot(showFVGvis and fvgBearFresh ? fvgBearTop : na, "Bear FVG Top", color=color.new(color.maroon, 60), style=plot.style_linebr, linewidth=1)
+plot(showFVGvis and fvgBearFresh ? fvgBearBot : na, "Bear FVG Bot", color=color.new(color.maroon, 60), style=plot.style_linebr, linewidth=1)
+
+plot(showDemSup and demandFresh ? demandTop : na, "Demand Top", color=color.new(color.green, 70), style=plot.style_linebr, linewidth=1)
+plot(showDemSup and demandFresh ? demandBot : na, "Demand Bot", color=color.new(color.green, 70), style=plot.style_linebr, linewidth=1)
+plot(showDemSup and supplyFresh ? supplyTop : na, "Supply Top", color=color.new(color.red, 70), style=plot.style_linebr, linewidth=1)
+plot(showDemSup and supplyFresh ? supplyBot : na, "Supply Bot", color=color.new(color.red, 70), style=plot.style_linebr, linewidth=1)
+
+plot(showLiquidation ? swingHigh20 : na, "Liq High", color=color.new(color.red, 85), style=plot.style_linebr, linewidth=1)
+plot(showLiquidation ? swingLow20 : na, "Liq Low", color=color.new(color.green, 85), style=plot.style_linebr, linewidth=1)
+
+var table t = table.new(position.top_right, 2, 12, border_width=1, frame_width=1, frame_color=color.gray)
+
+if showTable and barstate.islastconfirmedhistory
+    table.cell(t, 0, 0, "Setup", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 0, setup, text_color=color.white)
+    table.cell(t, 0, 1, "ADX", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 1, str.tostring(adx, "#.#"), text_color=color.white)
+    table.cell(t, 0, 2, "Score L", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 2, str.tostring(scoreLong) + "/" + str.tostring(minScore), text_color=color.white)
+    table.cell(t, 0, 3, "Score S", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 3, str.tostring(scoreShort) + "/" + str.tostring(minScore), text_color=color.white)
+    table.cell(t, 0, 4, "Bull OB", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 4, priceInBullOB ? "YES" : "no", text_color=color.white)
+    table.cell(t, 0, 5, "Bear OB", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 5, priceInBearOB ? "YES" : "no", text_color=color.white)
+    table.cell(t, 0, 6, "Bull FVG", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 6, priceInBullFVG ? "YES" : "no", text_color=color.white)
+    table.cell(t, 0, 7, "Bear FVG", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 7, priceInBearFVG ? "YES" : "no", text_color=color.white)
+    table.cell(t, 0, 8, "CHOCH", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 8, (bullChochFresh ? "L" : "-") + "/" + (bearChochFresh ? "S" : "-"), text_color=color.white)
+    table.cell(t, 0, 9, "Candle", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 9, bullHammer ? "Hammer" : (bearShooter ? "Shooter" : "-"), text_color=color.white)
+    table.cell(t, 0, 10, "Trades", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 10, str.tostring(dayTrades) + "/" + str.tostring(maxTrades), text_color=color.white)
+    table.cell(t, 0, 11, "Equity", bgcolor=color.gray, text_color=color.white)
+    table.cell(t, 1, 11, "$" + str.tostring(strategy.equity, "#.##"), text_color=color.white)
